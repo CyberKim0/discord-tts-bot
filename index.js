@@ -61,6 +61,8 @@ function createVoiceState(voiceChannel) {
     player,
     queue: [],
     speaking: false,
+    currentFile: null,
+    cleanup: null,
   };
 
   servers.set(guildId, state);
@@ -69,15 +71,41 @@ function createVoiceState(voiceChannel) {
 }
 
 // =========================
+// CLEANUP AUDIO
+// =========================
+
+function cleanupCurrent(guildId) {
+  const state = servers.get(guildId);
+
+  if (!state) return;
+
+  if (state.currentFile) {
+    try {
+      if (fs.existsSync(state.currentFile)) {
+        fs.unlinkSync(state.currentFile);
+      }
+    } catch (err) {
+      console.error("❌ File cleanup error:", err);
+    }
+  }
+
+  state.currentFile = null;
+  state.speaking = false;
+  state.cleanup = null;
+}
+
+// =========================
 // TTS QUEUE
 // =========================
 
-async function speakNext(guildId) {
+function speakNext(guildId) {
   const state = servers.get(guildId);
 
-  if (!state || state.speaking || state.queue.length === 0) {
-    return;
-  }
+  if (!state) return;
+
+  if (state.speaking) return;
+
+  if (state.queue.length === 0) return;
 
   state.speaking = true;
 
@@ -85,8 +113,12 @@ async function speakNext(guildId) {
 
   const filePath = path.join(
     __dirname,
-    `tts-${Date.now()}.mp3`
+    `tts-${Date.now()}-${Math.random()
+      .toString(36)
+      .slice(2)}.mp3`
   );
+
+  state.currentFile = filePath;
 
   try {
     const tts = new gTTS(
@@ -95,52 +127,69 @@ async function speakNext(guildId) {
     );
 
     tts.save(filePath, (error) => {
-      if (error) {
-        console.error("❌ TTS error:", error);
+      const currentState = servers.get(guildId);
 
+      if (!currentState) {
         if (fs.existsSync(filePath)) {
           fs.unlinkSync(filePath);
         }
+        return;
+      }
 
-        state.speaking = false;
+      if (error) {
+        console.error("❌ TTS error:", error);
+
+        cleanupCurrent(guildId);
         speakNext(guildId);
+
         return;
       }
 
       try {
         const resource = createAudioResource(filePath);
 
-        state.player.play(resource);
+        currentState.player.play(resource);
 
         console.log(`🔊 Speaking: ${item.text}`);
 
         const cleanup = () => {
-          if (fs.existsSync(filePath)) {
-            fs.unlinkSync(filePath);
+          const latestState = servers.get(guildId);
+
+          if (!latestState) {
+            if (fs.existsSync(filePath)) {
+              fs.unlinkSync(filePath);
+            }
+            return;
           }
 
-          state.speaking = false;
+          if (latestState.cleanup !== cleanup) {
+            return;
+          }
+
+          cleanupCurrent(guildId);
+
           speakNext(guildId);
         };
 
-        state.player.once(
+        currentState.cleanup = cleanup;
+
+        currentState.player.once(
           AudioPlayerStatus.Idle,
           cleanup
         );
 
-        state.player.once("error", (err) => {
-          console.error("❌ Audio error:", err);
-          cleanup();
-        });
+        currentState.player.once(
+          "error",
+          (err) => {
+            console.error("❌ Audio error:", err);
+            cleanup();
+          }
+        );
 
       } catch (err) {
         console.error("❌ Playback error:", err);
 
-        if (fs.existsSync(filePath)) {
-          fs.unlinkSync(filePath);
-        }
-
-        state.speaking = false;
+        cleanupCurrent(guildId);
         speakNext(guildId);
       }
     });
@@ -148,11 +197,7 @@ async function speakNext(guildId) {
   } catch (error) {
     console.error("❌ TTS error:", error);
 
-    if (fs.existsSync(filePath)) {
-      fs.unlinkSync(filePath);
-    }
-
-    state.speaking = false;
+    cleanupCurrent(guildId);
     speakNext(guildId);
   }
 }
@@ -209,12 +254,22 @@ client.on("messageCreate", async (message) => {
     }
 
     state.queue = [];
-    state.player.stop();
-    state.speaking = false;
+
+    try {
+      state.player.stop();
+    } catch {}
 
     try {
       state.connection.destroy();
     } catch {}
+
+    if (state.currentFile) {
+      try {
+        if (fs.existsSync(state.currentFile)) {
+          fs.unlinkSync(state.currentFile);
+        }
+      } catch {}
+    }
 
     servers.delete(guildId);
 
@@ -237,8 +292,12 @@ client.on("messageCreate", async (message) => {
     }
 
     state.queue = [];
-    state.player.stop();
-    state.speaking = false;
+
+    try {
+      state.player.stop();
+    } catch {}
+
+    cleanupCurrent(guildId);
 
     return message.reply(
       "🛑 Speech stopped and queue cleared."
@@ -264,9 +323,21 @@ client.on("messageCreate", async (message) => {
       );
     }
 
-    if (state.player.state.status === AudioPlayerStatus.Paused) {
+    if (
+      state.player.state.status ===
+      AudioPlayerStatus.Paused
+    ) {
       return message.reply(
         "⏸️ Speech is already paused."
+      );
+    }
+
+    if (
+      state.player.state.status !==
+      AudioPlayerStatus.Playing
+    ) {
+      return message.reply(
+        "❌ Nothing is currently playing."
       );
     }
 
@@ -290,7 +361,10 @@ client.on("messageCreate", async (message) => {
       );
     }
 
-    if (state.player.state.status !== AudioPlayerStatus.Paused) {
+    if (
+      state.player.state.status !==
+      AudioPlayerStatus.Paused
+    ) {
       return message.reply(
         "▶️ Nothing is paused."
       );
@@ -300,6 +374,140 @@ client.on("messageCreate", async (message) => {
 
     return message.reply(
       "▶️ Speech resumed."
+    );
+  }
+
+  // =========================
+  // !skip
+  // =========================
+
+  if (content === "!skip") {
+    const state = servers.get(guildId);
+
+    if (!state) {
+      return message.reply(
+        "❌ I'm not in a voice channel."
+      );
+    }
+
+    if (!state.speaking) {
+      return message.reply(
+        "❌ Nothing is currently playing."
+      );
+    }
+
+    state.player.stop();
+
+    return message.reply(
+      "⏭️ Skipped current speech."
+    );
+  }
+
+  // =========================
+  // !queue
+  // =========================
+
+  if (content === "!queue") {
+    const state = servers.get(guildId);
+
+    if (!state) {
+      return message.reply(
+        "❌ I'm not in a voice channel."
+      );
+    }
+
+    if (
+      state.queue.length === 0 &&
+      !state.speaking
+    ) {
+      return message.reply(
+        "📋 The speech queue is empty."
+      );
+    }
+
+    let response = "📋 **Speech Queue**\n\n";
+
+    if (state.speaking) {
+      response += "🔊 **Currently speaking**\n\n";
+    }
+
+    if (state.queue.length > 0) {
+      state.queue.forEach((item, index) => {
+        const text =
+          item.text.length > 100
+            ? item.text.slice(0, 100) + "..."
+            : item.text;
+
+        response += `**${index + 1}.** ${text}\n`;
+      });
+    } else {
+      response += "No messages waiting.";
+    }
+
+    return message.reply(response);
+  }
+
+  // =========================
+  // !clear
+  // =========================
+
+  if (content === "!clear") {
+    const state = servers.get(guildId);
+
+    if (!state) {
+      return message.reply(
+        "❌ I'm not in a voice channel."
+      );
+    }
+
+    if (state.queue.length === 0) {
+      return message.reply(
+        "📋 The queue is already empty."
+      );
+    }
+
+    const amount = state.queue.length;
+
+    state.queue = [];
+
+    return message.reply(
+      `🧹 Cleared **${amount}** queued message(s).`
+    );
+  }
+
+  // =========================
+  // !status
+  // =========================
+
+  if (content === "!status") {
+    const state = servers.get(guildId);
+
+    if (!state) {
+      return message.reply(
+        "🔴 I'm not in a voice channel."
+      );
+    }
+
+    let status = "⏹️ Idle";
+
+    if (
+      state.player.state.status ===
+      AudioPlayerStatus.Playing
+    ) {
+      status = "🟢 Playing";
+    }
+
+    if (
+      state.player.state.status ===
+      AudioPlayerStatus.Paused
+    ) {
+      status = "⏸️ Paused";
+    }
+
+    return message.reply(
+      `🎙️ **TTS Status**\n\n` +
+      `Status: ${status}\n` +
+      `Queue: **${state.queue.length}**`
     );
   }
 
@@ -327,7 +535,8 @@ client.on("messageCreate", async (message) => {
 
     // Automatically join user's VC
     if (!state) {
-      const voiceChannel = message.member?.voice?.channel;
+      const voiceChannel =
+        message.member?.voice?.channel;
 
       if (!voiceChannel) {
         return message.reply(
