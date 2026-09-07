@@ -9,11 +9,30 @@ const {
   createAudioResource,
   AudioPlayerStatus,
   NoSubscriberBehavior,
+  EndBehaviorType,
 } = require("@discordjs/voice");
 
+const OpenAI = require("openai");
 const gTTS = require("gtts");
+const prism = require("prism-media");
+
 const fs = require("fs");
 const path = require("path");
+const { spawn } = require("child_process");
+
+const ffmpegPath = require("ffmpeg-static");
+
+// =========================
+// OPENAI
+// =========================
+
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
+
+// =========================
+// DISCORD CLIENT
+// =========================
 
 const client = new Client({
   intents: [
@@ -63,6 +82,10 @@ function createVoiceState(voiceChannel) {
     speaking: false,
     currentFile: null,
     cleanup: null,
+
+    // AI voice listener
+    listening: false,
+    listeningUsers: new Set(),
   };
 
   servers.set(guildId, state);
@@ -102,9 +125,7 @@ function speakNext(guildId) {
   const state = servers.get(guildId);
 
   if (!state) return;
-
   if (state.speaking) return;
-
   if (state.queue.length === 0) return;
 
   state.speaking = true;
@@ -203,399 +224,887 @@ function speakNext(guildId) {
 }
 
 // =========================
+// ADD SPEECH TO QUEUE
+// =========================
+
+function queueSpeech(guildId, text) {
+  const state = servers.get(guildId);
+
+  if (!state) return;
+
+  state.queue.push({
+    text,
+    language: "en",
+  });
+
+  speakNext(guildId);
+}
+
+// =========================
+// PCM -> WAV
+// =========================
+
+function pcmToWav(inputFile, outputFile) {
+  return new Promise((resolve, reject) => {
+    const ffmpeg = spawn(ffmpegPath, [
+      "-f",
+      "s16le",
+
+      "-ar",
+      "48000",
+
+      "-ac",
+      "2",
+
+      "-i",
+      inputFile,
+
+      "-ar",
+      "16000",
+
+      "-ac",
+      "1",
+
+      "-c:a",
+      "pcm_s16le",
+
+      "-y",
+      outputFile,
+    ]);
+
+    let stderr = "";
+
+    ffmpeg.stderr.on("data", (data) => {
+      stderr += data.toString();
+    });
+
+    ffmpeg.on("error", reject);
+
+    ffmpeg.on("close", (code) => {
+      if (code === 0) {
+        resolve();
+      } else {
+        reject(
+          new Error(`FFmpeg failed: ${stderr}`)
+        );
+      }
+    });
+  });
+}
+
+// =========================
+// PROCESS VOICE WITH AI
+// =========================
+
+async function processVoice(
+  guildId,
+  userId,
+  pcmBuffer
+) {
+  const state = servers.get(guildId);
+
+  if (!state || !state.listening) return;
+
+  const baseName =
+    `voice-${Date.now()}-${Math.random()
+      .toString(36)
+      .slice(2)}`;
+
+  const pcmFile = path.join(
+    __dirname,
+    `${baseName}.pcm`
+  );
+
+  const wavFile = path.join(
+    __dirname,
+    `${baseName}.wav`
+  );
+
+  try {
+    console.log(
+      `🎤 Processing voice from ${userId}...`
+    );
+
+    fs.writeFileSync(pcmFile, pcmBuffer);
+
+    await pcmToWav(
+      pcmFile,
+      wavFile
+    );
+
+    // =========================
+    // TRANSCRIPTION
+    // =========================
+
+    const transcription =
+      await openai.audio.transcriptions.create({
+        file: fs.createReadStream(wavFile),
+        model: "gpt-4o-mini-transcribe",
+      });
+
+    const text =
+      transcription.text?.trim();
+
+    if (!text) {
+      return;
+    }
+
+    console.log(
+      `📝 Heard: ${text}`
+    );
+
+    // =========================
+    // AI RESPONSE
+    // =========================
+
+    const response =
+      await openai.responses.create({
+        model: "gpt-5.6-luna",
+
+        input: [
+          {
+            role: "system",
+            content:
+              "You are a friendly Discord voice assistant. " +
+              "Keep replies short and natural because your response " +
+              "will be spoken aloud in a voice channel. " +
+              "Do not use markdown, emojis, or long explanations.",
+          },
+
+          {
+            role: "user",
+            content: text,
+          },
+        ],
+      });
+
+    const reply =
+      response.output_text?.trim();
+
+    if (!reply) {
+      return;
+    }
+
+    console.log(
+      `🤖 AI: ${reply}`
+    );
+
+    // =========================
+    // SPEAK AI RESPONSE
+    // =========================
+
+    queueSpeech(
+      guildId,
+      reply
+    );
+
+  } catch (error) {
+    console.error(
+      "❌ Voice AI error:",
+      error
+    );
+  } finally {
+    // =========================
+    // CLEANUP
+    // =========================
+
+    try {
+      if (fs.existsSync(pcmFile)) {
+        fs.unlinkSync(pcmFile);
+      }
+    } catch {}
+
+    try {
+      if (fs.existsSync(wavFile)) {
+        fs.unlinkSync(wavFile);
+      }
+    } catch {}
+  }
+}
+
+// =========================
+// LISTEN TO USER
+// =========================
+
+function listenToUser(
+  guildId,
+  userId
+) {
+  const state = servers.get(guildId);
+
+  if (!state) return;
+
+  if (!state.listening) return;
+
+  if (state.listeningUsers.has(userId)) {
+    return;
+  }
+
+  state.listeningUsers.add(userId);
+
+  console.log(
+    `🎤 Listening to user: ${userId}`
+  );
+
+  const receiver =
+    state.connection.receiver;
+
+  const audioStream =
+    receiver.subscribe(userId, {
+      end: {
+        behavior:
+          EndBehaviorType.AfterSilence,
+
+        duration: 1000,
+      },
+    });
+
+  const decoder =
+    new prism.opus.Decoder({
+      rate: 48000,
+      channels: 2,
+      frameSize: 960,
+    });
+
+  const chunks = [];
+
+  audioStream
+    .pipe(decoder)
+    .on("data", (chunk) => {
+      chunks.push(chunk);
+    });
+
+  audioStream.on("end", async () => {
+    state.listeningUsers.delete(
+      userId
+    );
+
+    if (chunks.length === 0) {
+      return;
+    }
+
+    const pcmBuffer =
+      Buffer.concat(chunks);
+
+    if (pcmBuffer.length < 10000) {
+      return;
+    }
+
+    await processVoice(
+      guildId,
+      userId,
+      pcmBuffer
+    );
+  });
+
+  audioStream.on("error", (error) => {
+    state.listeningUsers.delete(
+      userId
+    );
+
+    console.error(
+      "❌ Voice receive error:",
+      error
+    );
+  });
+}
+
+// =========================
+// START VOICE LISTENER
+// =========================
+
+function startVoiceListener(
+  guildId
+) {
+  const state = servers.get(guildId);
+
+  if (!state) return;
+
+  if (state.listening) return;
+
+  state.listening = true;
+
+  const receiver =
+    state.connection.receiver;
+
+  receiver.speaking.on(
+    "start",
+    (userId) => {
+      if (!state.listening) return;
+
+      // Don't process the bot itself
+      if (
+        userId === client.user.id
+      ) {
+        return;
+      }
+
+      listenToUser(
+        guildId,
+        userId
+      );
+    }
+  );
+
+  console.log(
+    `🎤 Voice AI listening enabled in ${guildId}`
+  );
+}
+
+// =========================
+// STOP VOICE LISTENER
+// =========================
+
+function stopVoiceListener(
+  guildId
+) {
+  const state = servers.get(guildId);
+
+  if (!state) return;
+
+  state.listening = false;
+  state.listeningUsers.clear();
+
+  console.log(
+    `🔇 Voice AI listening disabled in ${guildId}`
+  );
+}
+
+// =========================
 // PREFIX COMMANDS
 // =========================
 
-client.on("messageCreate", async (message) => {
-  if (message.author.bot) return;
+client.on(
+  "messageCreate",
+  async (message) => {
+    if (message.author.bot) return;
 
-  const content = message.content.trim();
-  const guildId = message.guild?.id;
+    const content =
+      message.content.trim();
 
-  if (!guildId) return;
-   
-  // =========================
-  // !command
-  // =========================
+    const guildId =
+      message.guild?.id;
 
-  if (content === "!command" || content === "!commands") {
-    return message.reply(
-      "🎙️ **TTS BOT — COMMANDS**\n\n" +
-      "🔊 **VOICE**\n" +
-      "`!join` — Join your voice channel\n" +
-      "`!leave` — Leave the voice channel\n\n" +
+    if (!guildId) return;
 
-      "🗣️ **SPEECH**\n" +
-      "`!say <message>` — Make the bot speak\n" +
-      "`!pause` — Pause speech\n" +
-      "`!play` — Resume speech\n" +
-      "`!skip` — Skip current speech\n" +
-      "`!stop` — Stop speech and clear queue\n\n" +
-
-      "📋 **QUEUE**\n" +
-      "`!queue` — Show the speech queue\n" +
-      "`!clear` — Clear the queue\n\n" +
-
-      "📊 **STATUS**\n" +
-      "`!status` — Show bot status\n\n" +
-
-      "ℹ️ **HELP**\n" +
-      "`!command` — Show all commands"
-    );
-  }
-
-  // =========================
-  // !join
-  // =========================
-
-  if (content === "!join") {
-    const voiceChannel = message.member?.voice?.channel;
-
-    if (!voiceChannel) {
-      return message.reply(
-        "❌ Join a voice channel first."
-      );
-    }
-
-    if (servers.get(guildId)) {
-      return message.reply(
-        "✅ I'm already in a voice channel."
-      );
-    }
-
-    createVoiceState(voiceChannel);
-
-    return message.reply(
-      `🔊 Joined **${voiceChannel.name}**.`
-    );
-  }
-
-  // =========================
-  // !leave
-  // =========================
-
-  if (content === "!leave") {
-    const state = servers.get(guildId);
-
-    if (!state) {
-      return message.reply(
-        "❌ I'm not in a voice channel."
-      );
-    }
-
-    state.queue = [];
-
-    try {
-      state.player.stop();
-    } catch {}
-
-    try {
-      state.connection.destroy();
-    } catch {}
-
-    if (state.currentFile) {
-      try {
-        if (fs.existsSync(state.currentFile)) {
-          fs.unlinkSync(state.currentFile);
-        }
-      } catch {}
-    }
-
-    servers.delete(guildId);
-
-    return message.reply(
-      "👋 Left the voice channel."
-    );
-  }
-
-  // =========================
-  // !stop
-  // =========================
-
-  if (content === "!stop") {
-    const state = servers.get(guildId);
-
-    if (!state) {
-      return message.reply(
-        "❌ I'm not in a voice channel."
-      );
-    }
-
-    state.queue = [];
-
-    try {
-      state.player.stop();
-    } catch {}
-
-    cleanupCurrent(guildId);
-
-    return message.reply(
-      "🛑 Speech stopped and queue cleared."
-    );
-  }
-
-  // =========================
-  // !pause
-  // =========================
-
-  if (content === "!pause") {
-    const state = servers.get(guildId);
-
-    if (!state) {
-      return message.reply(
-        "❌ I'm not in a voice channel."
-      );
-    }
-
-    if (!state.speaking) {
-      return message.reply(
-        "❌ Nothing is currently playing."
-      );
-    }
+    // =========================
+    // !command
+    // =========================
 
     if (
-      state.player.state.status ===
-      AudioPlayerStatus.Paused
+      content === "!command" ||
+      content === "!commands"
     ) {
       return message.reply(
-        "⏸️ Speech is already paused."
+        "🎙️ **TTS + AI VOICE BOT**\n\n" +
+
+        "🔊 **VOICE**\n" +
+        "`!join` — Join your voice channel\n" +
+        "`!leave` — Leave the voice channel\n\n" +
+
+        "🤖 **AI VOICE**\n" +
+        "`!listen` — Enable AI voice listening\n" +
+        "`!unlisten` — Disable AI voice listening\n\n" +
+
+        "🗣️ **SPEECH**\n" +
+        "`!say <message>` — Make the bot speak\n" +
+        "`!pause` — Pause speech\n" +
+        "`!play` — Resume speech\n" +
+        "`!skip` — Skip current speech\n" +
+        "`!stop` — Stop speech and clear queue\n\n" +
+
+        "📋 **QUEUE**\n" +
+        "`!queue` — Show the speech queue\n" +
+        "`!clear` — Clear the queue\n\n" +
+
+        "📊 **STATUS**\n" +
+        "`!status` — Show bot status"
       );
     }
 
-    if (
-      state.player.state.status !==
-      AudioPlayerStatus.Playing
-    ) {
-      return message.reply(
-        "❌ Nothing is currently playing."
-      );
-    }
+    // =========================
+    // !join
+    // =========================
 
-    state.player.pause();
-
-    return message.reply(
-      "⏸️ Speech paused."
-    );
-  }
-
-  // =========================
-  // !play
-  // =========================
-
-  if (content === "!play") {
-    const state = servers.get(guildId);
-
-    if (!state) {
-      return message.reply(
-        "❌ I'm not in a voice channel."
-      );
-    }
-
-    if (
-      state.player.state.status !==
-      AudioPlayerStatus.Paused
-    ) {
-      return message.reply(
-        "▶️ Nothing is paused."
-      );
-    }
-
-    state.player.unpause();
-
-    return message.reply(
-      "▶️ Speech resumed."
-    );
-  }
-
-  // =========================
-  // !skip
-  // =========================
-
-  if (content === "!skip") {
-    const state = servers.get(guildId);
-
-    if (!state) {
-      return message.reply(
-        "❌ I'm not in a voice channel."
-      );
-    }
-
-    if (!state.speaking) {
-      return message.reply(
-        "❌ Nothing is currently playing."
-      );
-    }
-
-    state.player.stop();
-
-    return message.reply(
-      "⏭️ Skipped current speech."
-    );
-  }
-
-  // =========================
-  // !queue
-  // =========================
-
-  if (content === "!queue") {
-    const state = servers.get(guildId);
-
-    if (!state) {
-      return message.reply(
-        "❌ I'm not in a voice channel."
-      );
-    }
-
-    if (
-      state.queue.length === 0 &&
-      !state.speaking
-    ) {
-      return message.reply(
-        "📋 The speech queue is empty."
-      );
-    }
-
-    let response = "📋 **Speech Queue**\n\n";
-
-    if (state.speaking) {
-      response += "🔊 **Currently speaking**\n\n";
-    }
-
-    if (state.queue.length > 0) {
-      state.queue.forEach((item, index) => {
-        const text =
-          item.text.length > 100
-            ? item.text.slice(0, 100) + "..."
-            : item.text;
-
-        response += `**${index + 1}.** ${text}\n`;
-      });
-    } else {
-      response += "No messages waiting.";
-    }
-
-    return message.reply(response);
-  }
-
-  // =========================
-  // !clear
-  // =========================
-
-  if (content === "!clear") {
-    const state = servers.get(guildId);
-
-    if (!state) {
-      return message.reply(
-        "❌ I'm not in a voice channel."
-      );
-    }
-
-    if (state.queue.length === 0) {
-      return message.reply(
-        "📋 The queue is already empty."
-      );
-    }
-
-    const amount = state.queue.length;
-
-    state.queue = [];
-
-    return message.reply(
-      `🧹 Cleared **${amount}** queued message(s).`
-    );
-  }
-
-  // =========================
-  // !status
-  // =========================
-
-  if (content === "!status") {
-    const state = servers.get(guildId);
-
-    if (!state) {
-      return message.reply(
-        "🔴 I'm not in a voice channel."
-      );
-    }
-
-    let status = "⏹️ Idle";
-
-    if (
-      state.player.state.status ===
-      AudioPlayerStatus.Playing
-    ) {
-      status = "🟢 Playing";
-    }
-
-    if (
-      state.player.state.status ===
-      AudioPlayerStatus.Paused
-    ) {
-      status = "⏸️ Paused";
-    }
-
-    return message.reply(
-      `🎙️ **TTS Status**\n\n` +
-      `Status: ${status}\n` +
-      `Queue: **${state.queue.length}**`
-    );
-  }
-
-  // =========================
-  // !say
-  // =========================
-
-  if (content.startsWith("!say ")) {
-    const text = content.slice(5).trim();
-
-    if (!text) {
-      return message.reply(
-        "❌ Give me something to say."
-      );
-    }
-
-    // 2,000 character limit
-    if (text.length > 2000) {
-      return message.reply(
-        "❌ Keep the message under 2000 characters."
-      );
-    }
-
-    let state = servers.get(guildId);
-
-    // Automatically join user's VC
-    if (!state) {
+    if (content === "!join") {
       const voiceChannel =
         message.member?.voice?.channel;
 
       if (!voiceChannel) {
         return message.reply(
-          "❌ Join a voice channel first, or use `!join`."
+          "❌ Join a voice channel first."
         );
       }
 
-      state = createVoiceState(voiceChannel);
+      if (servers.get(guildId)) {
+        return message.reply(
+          "✅ I'm already in a voice channel."
+        );
+      }
+
+      createVoiceState(
+        voiceChannel
+      );
+
+      return message.reply(
+        `🔊 Joined **${voiceChannel.name}**.`
+      );
     }
 
-    state.queue.push({
-      text,
-      language: "en",
-    });
+    // =========================
+    // !listen
+    // =========================
 
-    const position =
-      state.queue.length +
-      (state.speaking ? 1 : 0);
+    if (content === "!listen") {
+      let state =
+        servers.get(guildId);
 
-    await message.reply(
-      `📋 Added to speech queue. Position: **${position}**`
-    );
+      if (!state) {
+        const voiceChannel =
+          message.member?.voice?.channel;
 
-    speakNext(guildId);
+        if (!voiceChannel) {
+          return message.reply(
+            "❌ Join a voice channel first."
+          );
+        }
+
+        state =
+          createVoiceState(
+            voiceChannel
+          );
+      }
+
+      if (state.listening) {
+        return message.reply(
+          "🎤 I'm already listening."
+        );
+      }
+
+      startVoiceListener(
+        guildId
+      );
+
+      return message.reply(
+        "🎤 **Voice AI enabled.**\n" +
+        "I'll respond to speech I receive in this voice channel. " +
+        "Make sure everyone participating knows voice is being processed."
+      );
+    }
+
+    // =========================
+    // !unlisten
+    // =========================
+
+    if (content === "!unlisten") {
+      const state =
+        servers.get(guildId);
+
+      if (!state) {
+        return message.reply(
+          "❌ I'm not in a voice channel."
+        );
+      }
+
+      if (!state.listening) {
+        return message.reply(
+          "🔇 Voice AI is already disabled."
+        );
+      }
+
+      stopVoiceListener(
+        guildId
+      );
+
+      return message.reply(
+        "🔇 **Voice AI disabled.**"
+      );
+    }
+
+    // =========================
+    // !leave
+    // =========================
+
+    if (content === "!leave") {
+      const state =
+        servers.get(guildId);
+
+      if (!state) {
+        return message.reply(
+          "❌ I'm not in a voice channel."
+        );
+      }
+
+      state.queue = [];
+
+      stopVoiceListener(
+        guildId
+      );
+
+      try {
+        state.player.stop();
+      } catch {}
+
+      try {
+        state.connection.destroy();
+      } catch {}
+
+      if (state.currentFile) {
+        try {
+          if (
+            fs.existsSync(
+              state.currentFile
+            )
+          ) {
+            fs.unlinkSync(
+              state.currentFile
+            );
+          }
+        } catch {}
+      }
+
+      servers.delete(
+        guildId
+      );
+
+      return message.reply(
+        "👋 Left the voice channel."
+      );
+    }
+
+    // =========================
+    // !stop
+    // =========================
+
+    if (content === "!stop") {
+      const state =
+        servers.get(guildId);
+
+      if (!state) {
+        return message.reply(
+          "❌ I'm not in a voice channel."
+        );
+      }
+
+      state.queue = [];
+
+      try {
+        state.player.stop();
+      } catch {}
+
+      cleanupCurrent(
+        guildId
+      );
+
+      return message.reply(
+        "🛑 Speech stopped and queue cleared."
+      );
+    }
+
+    // =========================
+    // !pause
+    // =========================
+
+    if (content === "!pause") {
+      const state =
+        servers.get(guildId);
+
+      if (!state) {
+        return message.reply(
+          "❌ I'm not in a voice channel."
+        );
+      }
+
+      if (!state.speaking) {
+        return message.reply(
+          "❌ Nothing is currently playing."
+        );
+      }
+
+      if (
+        state.player.state.status ===
+        AudioPlayerStatus.Paused
+      ) {
+        return message.reply(
+          "⏸️ Speech is already paused."
+        );
+      }
+
+      if (
+        state.player.state.status !==
+        AudioPlayerStatus.Playing
+      ) {
+        return message.reply(
+          "❌ Nothing is currently playing."
+        );
+      }
+
+      state.player.pause();
+
+      return message.reply(
+        "⏸️ Speech paused."
+      );
+    }
+
+    // =========================
+    // !play
+    // =========================
+
+    if (content === "!play") {
+      const state =
+        servers.get(guildId);
+
+      if (!state) {
+        return message.reply(
+          "❌ I'm not in a voice channel."
+        );
+      }
+
+      if (
+        state.player.state.status !==
+        AudioPlayerStatus.Paused
+      ) {
+        return message.reply(
+          "▶️ Nothing is paused."
+        );
+      }
+
+      state.player.unpause();
+
+      return message.reply(
+        "▶️ Speech resumed."
+      );
+    }
+
+    // =========================
+    // !skip
+    // =========================
+
+    if (content === "!skip") {
+      const state =
+        servers.get(guildId);
+
+      if (!state) {
+        return message.reply(
+          "❌ I'm not in a voice channel."
+        );
+      }
+
+      if (!state.speaking) {
+        return message.reply(
+          "❌ Nothing is currently playing."
+        );
+      }
+
+      state.player.stop();
+
+      return message.reply(
+        "⏭️ Skipped current speech."
+      );
+    }
+
+    // =========================
+    // !queue
+    // =========================
+
+    if (content === "!queue") {
+      const state =
+        servers.get(guildId);
+
+      if (!state) {
+        return message.reply(
+          "❌ I'm not in a voice channel."
+        );
+      }
+
+      if (
+        state.queue.length === 0 &&
+        !state.speaking
+      ) {
+        return message.reply(
+          "📋 The speech queue is empty."
+        );
+      }
+
+      let response =
+        "📋 **Speech Queue**\n\n";
+
+      if (state.speaking) {
+        response +=
+          "🔊 **Currently speaking**\n\n";
+      }
+
+      if (
+        state.queue.length > 0
+      ) {
+        state.queue.forEach(
+          (item, index) => {
+            const text =
+              item.text.length > 100
+                ? item.text.slice(
+                    0,
+                    100
+                  ) + "..."
+                : item.text;
+
+            response +=
+              `**${index + 1}.** ${text}\n`;
+          }
+        );
+      } else {
+        response +=
+          "No messages waiting.";
+      }
+
+      return message.reply(
+        response
+      );
+    }
+
+    // =========================
+    // !clear
+    // =========================
+
+    if (content === "!clear") {
+      const state =
+        servers.get(guildId);
+
+      if (!state) {
+        return message.reply(
+          "❌ I'm not in a voice channel."
+        );
+      }
+
+      if (
+        state.queue.length === 0
+      ) {
+        return message.reply(
+          "📋 The queue is already empty."
+        );
+      }
+
+      const amount =
+        state.queue.length;
+
+      state.queue = [];
+
+      return message.reply(
+        `🧹 Cleared **${amount}** queued message(s).`
+      );
+    }
+
+    // =========================
+    // !status
+    // =========================
+
+    if (content === "!status") {
+      const state =
+        servers.get(guildId);
+
+      if (!state) {
+        return message.reply(
+          "🔴 I'm not in a voice channel."
+        );
+      }
+
+      let status =
+        "⏹️ Idle";
+
+      if (
+        state.player.state.status ===
+        AudioPlayerStatus.Playing
+      ) {
+        status =
+          "🟢 Playing";
+      }
+
+      if (
+        state.player.state.status ===
+        AudioPlayerStatus.Paused
+      ) {
+        status =
+          "⏸️ Paused";
+      }
+
+      return message.reply(
+        `🎙️ **TTS + AI Status**\n\n` +
+        `Status: ${status}\n` +
+        `AI Listening: **${
+          state.listening
+            ? "ON"
+            : "OFF"
+        }**\n` +
+        `Queue: **${state.queue.length}**`
+      );
+    }
+
+    // =========================
+    // !say
+    // =========================
+
+    if (content.startsWith("!say ")) {
+      const text =
+        content
+          .slice(5)
+          .trim();
+
+      if (!text) {
+        return message.reply(
+          "❌ Give me something to say."
+        );
+      }
+
+      if (text.length > 2000) {
+        return message.reply(
+          "❌ Keep the message under 2000 characters."
+        );
+      }
+
+      let state =
+        servers.get(guildId);
+
+      if (!state) {
+        const voiceChannel =
+          message.member?.voice?.channel;
+
+        if (!voiceChannel) {
+          return message.reply(
+            "❌ Join a voice channel first, or use `!join`."
+          );
+        }
+
+        state =
+          createVoiceState(
+            voiceChannel
+          );
+      }
+
+      state.queue.push({
+        text,
+        language: "en",
+      });
+
+      const position =
+        state.queue.length +
+        (state.speaking
+          ? 1
+          : 0);
+
+      await message.reply(
+        `📋 Added to speech queue. Position: **${position}**`
+      );
+
+      speakNext(
+        guildId
+      );
+    }
   }
-});
+);
 
 // =========================
 // LOGIN
 // =========================
 
-client.login(process.env.DISCORD_TOKEN);
+client.login(
+  process.env.DISCORD_TOKEN
+);
