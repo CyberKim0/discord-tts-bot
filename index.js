@@ -213,6 +213,36 @@ client.on("messageCreate", async (message) => {
   const guildId = message.guild?.id;
 
   if (!guildId) return;
+   
+  // =========================
+  // !command
+  // =========================
+
+  if (content === "!command" || content === "!commands") {
+    return message.reply(
+      "🎙️ **TTS BOT — COMMANDS**\n\n" +
+      "🔊 **VOICE**\n" +
+      "`!join` — Join your voice channel\n" +
+      "`!leave` — Leave the voice channel\n\n" +
+
+      "🗣️ **SPEECH**\n" +
+      "`!say <message>` — Make the bot speak\n" +
+      "`!pause` — Pause speech\n" +
+      "`!play` — Resume speech\n" +
+      "`!skip` — Skip current speech\n" +
+      "`!stop` — Stop speech and clear queue\n\n" +
+
+      "📋 **QUEUE**\n" +
+      "`!queue` — Show the speech queue\n" +
+      "`!clear` — Clear the queue\n\n" +
+
+      "📊 **STATUS**\n" +
+      "`!status` — Show bot status\n\n" +
+
+      "ℹ️ **HELP**\n" +
+      "`!command` — Show all commands"
+    );
+  }
 
   // =========================
   // !join
