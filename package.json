@@ -1,7 +1,7 @@
 {
   "name": "discord-tts-bot",
   "version": "1.0.0",
-  "description": "Discord text to speech bot",
+  "description": "Discord AI voice bot",
   "main": "index.js",
   "scripts": {
     "start": "node deploy-commands.js && node index.js"
@@ -11,8 +11,10 @@
   },
   "dependencies": {
     "@discordjs/voice": "^0.19.0",
+    "@discordjs/opus": "^0.10.0",
     "discord.js": "^14.25.1",
     "gtts": "^0.2.1",
-    "ffmpeg-static": "^5.2.0"
+    "ffmpeg-static": "^5.2.0",
+    "openai": "^6.0.0"
   }
 }
