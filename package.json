@@ -4,7 +4,7 @@
   "description": "Discord text to speech bot",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node deploy-commands.js && node index.js"
   },
   "engines": {
     "node": ">=24.17.0"
