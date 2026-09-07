@@ -262,9 +262,9 @@ client.on("interactionCreate", async (interaction) => {
       );
     }
 
-    if (text.length > 500) {
+    if (text.length > 2000) {
       return interaction.reply(
-        "❌ Keep the message under 500 characters."
+        "❌ Keep the message under 2000 characters."
       );
     }
 
