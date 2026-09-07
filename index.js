@@ -14,10 +14,13 @@ const {
 
 const prism = require("prism-media");
 const OpenAI = require("openai");
-const gTTS = require("gtts");
 
 const fs = require("fs");
 const path = require("path");
+
+// =========================
+// CLIENT
+// =========================
 
 const client = new Client({
   intents: [
@@ -41,6 +44,10 @@ const openai = new OpenAI({
 // =========================
 
 const servers = new Map();
+
+// =========================
+// READY
+// =========================
 
 client.once("clientReady", () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
@@ -90,6 +97,8 @@ function createWavBuffer(pcmData) {
 
 async function getAIResponse(text) {
   try {
+    console.log(`🧠 Sending to AI: ${text}`);
+
     const response = await openai.responses.create({
       model: "gpt-5.6-luna",
       input: [
@@ -97,7 +106,8 @@ async function getAIResponse(text) {
           role: "system",
           content:
             "You are a friendly Discord voice assistant. " +
-            "Keep your replies short and natural because they will be spoken aloud.",
+            "Reply naturally and briefly because your response will be spoken aloud. " +
+            "Do not use markdown, emojis, or long paragraphs.",
         },
         {
           role: "user",
@@ -106,10 +116,67 @@ async function getAIResponse(text) {
       ],
     });
 
-    return response.output_text?.trim() || "I didn't catch that.";
+    const reply =
+      response.output_text?.trim() ||
+      "I didn't catch that.";
+
+    console.log(`🤖 AI replied: ${reply}`);
+
+    return reply;
   } catch (error) {
-    console.error("❌ OpenAI error:", error);
+    console.error("❌ OpenAI response error:", error);
+
     return "Sorry, I couldn't process that.";
+  }
+}
+
+// =========================
+// OPENAI TEXT TO SPEECH
+// =========================
+
+async function createSpeechFile(text) {
+  const filePath = path.join(
+    __dirname,
+    `tts-${Date.now()}-${Math.random()
+      .toString(36)
+      .slice(2)}.mp3`
+  );
+
+  try {
+    console.log("🔊 Generating AI voice...");
+
+    const speech = await openai.audio.speech.create({
+      model: "gpt-4o-mini-tts",
+      voice: "alloy",
+      input: text,
+      response_format: "mp3",
+    });
+
+    const buffer = Buffer.from(
+      await speech.arrayBuffer()
+    );
+
+    await fs.promises.writeFile(
+      filePath,
+      buffer
+    );
+
+    console.log("✅ Voice file created.");
+
+    return filePath;
+  } catch (error) {
+    console.error(
+      "❌ OpenAI TTS error:",
+      error
+    );
+
+    try {
+      if (fs.existsSync(filePath)) {
+        fs.unlinkSync(filePath);
+      }
+    } catch {}
+
+    return null;
   }
 }
 
@@ -118,36 +185,55 @@ async function getAIResponse(text) {
 // =========================
 
 function listenToUser(state, userId) {
-  if (!state || state.listeningUsers.has(userId)) {
+  if (!state) return;
+
+  if (state.listeningUsers.has(userId)) {
     return;
   }
 
-  const guild = state.connection.joinConfig.guildId
-    ? client.guilds.cache.get(
-        state.connection.joinConfig.guildId
-      )
-    : null;
+  const guildId =
+    state.connection.joinConfig.guildId;
 
-  const member = guild?.members.cache.get(userId);
+  const guild =
+    client.guilds.cache.get(guildId);
 
-  // Don't listen to bots
+  const member =
+    guild?.members.cache.get(userId);
+
+  // Ignore bots
   if (member?.user?.bot) {
     return;
   }
 
   state.listeningUsers.add(userId);
 
-  console.log(`🎤 Listening to ${userId}`);
-
-  const audioStream = state.connection.receiver.subscribe(
-    userId,
-    {
-      end: {
-        behavior: EndBehaviorType.AfterSilence,
-        duration: 1000,
-      },
-    }
+  console.log(
+    `🎤 Voice detected from user ${userId}`
   );
+
+  let audioStream;
+
+  try {
+    audioStream =
+      state.connection.receiver.subscribe(
+        userId,
+        {
+          end: {
+            behavior:
+              EndBehaviorType.AfterSilence,
+            duration: 1000,
+          },
+        }
+      );
+  } catch (error) {
+    console.error(
+      "❌ Could not subscribe to voice:",
+      error
+    );
+
+    state.listeningUsers.delete(userId);
+    return;
+  }
 
   const decoder = new prism.opus.Decoder({
     rate: 48000,
@@ -156,6 +242,22 @@ function listenToUser(state, userId) {
   });
 
   const pcmChunks = [];
+
+  audioStream.on("error", (error) => {
+    console.error(
+      "❌ Discord audio stream error:",
+      error
+    );
+  });
+
+  decoder.on("error", (error) => {
+    console.error(
+      "❌ Opus decoder error:",
+      error
+    );
+
+    state.listeningUsers.delete(userId);
+  });
 
   audioStream.pipe(decoder);
 
@@ -166,18 +268,27 @@ function listenToUser(state, userId) {
   decoder.on("end", async () => {
     state.listeningUsers.delete(userId);
 
+    console.log(
+      `🎤 Finished listening to ${userId}`
+    );
+
     if (pcmChunks.length === 0) {
+      console.log("⚠️ No audio received.");
       return;
     }
 
-    const pcmData = Buffer.concat(pcmChunks);
+    const pcmData =
+      Buffer.concat(pcmChunks);
 
-    // Ignore extremely short audio
     if (pcmData.length < 5000) {
+      console.log(
+        "⚠️ Voice recording was too short."
+      );
       return;
     }
 
-    const wavData = createWavBuffer(pcmData);
+    const wavData =
+      createWavBuffer(pcmData);
 
     const filePath = path.join(
       __dirname,
@@ -187,47 +298,91 @@ function listenToUser(state, userId) {
     );
 
     try {
-      fs.writeFileSync(filePath, wavData);
+      await fs.promises.writeFile(
+        filePath,
+        wavData
+      );
 
-      console.log("🧠 Transcribing speech...");
+      console.log(
+        "🧠 Transcribing voice..."
+      );
 
       const transcription =
-        await openai.audio.transcriptions.create({
-          file: fs.createReadStream(filePath),
-          model: "gpt-4o-mini-transcribe",
-        });
+        await openai.audio.transcriptions.create(
+          {
+            file:
+              fs.createReadStream(
+                filePath
+              ),
+            model:
+              "gpt-4o-mini-transcribe",
+          }
+        );
 
-      const text = transcription.text?.trim();
+      const text =
+        transcription.text?.trim();
 
       if (!text) {
-        fs.unlinkSync(filePath);
+        console.log(
+          "⚠️ No speech detected."
+        );
+
+        await fs.promises.unlink(
+          filePath
+        );
+
         return;
       }
 
-      console.log(`👤 User said: ${text}`);
+      console.log(
+        `👤 User said: ${text}`
+      );
 
       // =========================
       // AI RESPONSE
       // =========================
 
-      const reply = await getAIResponse(text);
-
-      console.log(`🤖 AI: ${reply}`);
+      const reply =
+        await getAIResponse(text);
 
       // =========================
-      // SPEAK AI RESPONSE
+      // CREATE AI VOICE
+      // =========================
+
+      const speechFile =
+        await createSpeechFile(
+          reply
+        );
+
+      if (!speechFile) {
+        await fs.promises.unlink(
+          filePath
+        );
+
+        return;
+      }
+
+      // =========================
+      // ADD TO QUEUE
       // =========================
 
       state.queue.push({
+        filePath: speechFile,
         text: reply,
-        language: "en",
       });
 
-      speakNext(
-        state.connection.joinConfig.guildId
+      console.log(
+        `📋 Added AI reply to voice queue. Queue: ${state.queue.length}`
       );
 
-      fs.unlinkSync(filePath);
+      speakNext(guildId);
+
+      // Remove input WAV
+      try {
+        await fs.promises.unlink(
+          filePath
+        );
+      } catch {}
 
     } catch (error) {
       console.error(
@@ -237,15 +392,12 @@ function listenToUser(state, userId) {
 
       try {
         if (fs.existsSync(filePath)) {
-          fs.unlinkSync(filePath);
+          await fs.promises.unlink(
+            filePath
+          );
         }
       } catch {}
     }
-  });
-
-  decoder.on("error", (error) => {
-    console.error("❌ Audio decoder error:", error);
-    state.listeningUsers.delete(userId);
   });
 }
 
@@ -253,38 +405,56 @@ function listenToUser(state, userId) {
 // CREATE VOICE STATE
 // =========================
 
-function createVoiceState(voiceChannel) {
-  const guildId = voiceChannel.guild.id;
+function createVoiceState(
+  voiceChannel
+) {
+  const guildId =
+    voiceChannel.guild.id;
 
-  const connection = joinVoiceChannel({
-    channelId: voiceChannel.id,
-    guildId,
-    adapterCreator:
-      voiceChannel.guild.voiceAdapterCreator,
-    selfDeaf: false,
-  });
+  const connection =
+    joinVoiceChannel({
+      channelId:
+        voiceChannel.id,
 
-  const player = createAudioPlayer({
-    behaviors: {
-      noSubscriber: NoSubscriberBehavior.Play,
-    },
-  });
+      guildId,
+
+      adapterCreator:
+        voiceChannel.guild
+          .voiceAdapterCreator,
+
+      selfDeaf: false,
+      selfMute: false,
+    });
+
+  const player =
+    createAudioPlayer({
+      behaviors: {
+        noSubscriber:
+          NoSubscriberBehavior.Play,
+      },
+    });
 
   connection.subscribe(player);
 
   const state = {
     connection,
     player,
+
     queue: [],
+
     speaking: false,
+
     currentFile: null,
+
     cleanup: null,
 
-    // NEW
     listeningUsers: new Set(),
   };
 
-  servers.set(guildId, state);
+  servers.set(
+    guildId,
+    state
+  );
 
   // =========================
   // VOICE LISTENER
@@ -293,7 +463,10 @@ function createVoiceState(voiceChannel) {
   connection.receiver.speaking.on(
     "start",
     (userId) => {
-      listenToUser(state, userId);
+      listenToUser(
+        state,
+        userId
+      );
     }
   );
 
@@ -305,23 +478,32 @@ function createVoiceState(voiceChannel) {
 }
 
 // =========================
-// CLEANUP AUDIO
+// CLEANUP CURRENT AUDIO
 // =========================
 
-function cleanupCurrent(guildId) {
-  const state = servers.get(guildId);
+function cleanupCurrent(
+  guildId
+) {
+  const state =
+    servers.get(guildId);
 
   if (!state) return;
 
   if (state.currentFile) {
     try {
-      if (fs.existsSync(state.currentFile)) {
-        fs.unlinkSync(state.currentFile);
+      if (
+        fs.existsSync(
+          state.currentFile
+        )
+      ) {
+        fs.unlinkSync(
+          state.currentFile
+        );
       }
-    } catch (err) {
+    } catch (error) {
       console.error(
         "❌ File cleanup error:",
-        err
+        error
       );
     }
   }
@@ -332,125 +514,136 @@ function cleanupCurrent(guildId) {
 }
 
 // =========================
-// TTS QUEUE
+// SPEAK NEXT
 // =========================
 
-function speakNext(guildId) {
-  const state = servers.get(guildId);
+function speakNext(
+  guildId
+) {
+  const state =
+    servers.get(guildId);
 
   if (!state) return;
 
-  if (state.speaking) return;
+  if (state.speaking) {
+    return;
+  }
 
-  if (state.queue.length === 0) return;
+  if (state.queue.length === 0) {
+    return;
+  }
 
   state.speaking = true;
 
-  const item = state.queue.shift();
+  const item =
+    state.queue.shift();
 
-  const filePath = path.join(
-    __dirname,
-    `tts-${Date.now()}-${Math.random()
-      .toString(36)
-      .slice(2)}.mp3`
-  );
+  const filePath =
+    item.filePath;
 
-  state.currentFile = filePath;
+  state.currentFile =
+    filePath;
 
   try {
-    const tts = new gTTS(
-      item.text,
-      item.language || "en"
+    console.log(
+      `🔊 Playing AI voice: ${item.text}`
     );
 
-    tts.save(filePath, (error) => {
-      const currentState = servers.get(guildId);
+    const resource =
+      createAudioResource(
+        filePath
+      );
 
-      if (!currentState) {
-        if (fs.existsSync(filePath)) {
-          fs.unlinkSync(filePath);
+    state.player.play(
+      resource
+    );
+
+    const cleanup =
+      () => {
+        const latestState =
+          servers.get(guildId);
+
+        if (!latestState) {
+          try {
+            if (
+              fs.existsSync(
+                filePath
+              )
+            ) {
+              fs.unlinkSync(
+                filePath
+              );
+            }
+          } catch {}
+
+          return;
         }
 
-        return;
-      }
+        if (
+          latestState.cleanup !==
+          cleanup
+        ) {
+          return;
+        }
 
-      if (error) {
-        console.error("❌ TTS error:", error);
-
-        cleanupCurrent(guildId);
-        speakNext(guildId);
-
-        return;
-      }
-
-      try {
-        const resource =
-          createAudioResource(filePath);
-
-        currentState.player.play(resource);
+        cleanupCurrent(
+          guildId
+        );
 
         console.log(
-          `🔊 Speaking: ${item.text}`
+          "✅ Finished speaking."
         );
 
-        const cleanup = () => {
-          const latestState =
-            servers.get(guildId);
-
-          if (!latestState) {
-            if (fs.existsSync(filePath)) {
-              fs.unlinkSync(filePath);
-            }
-
-            return;
-          }
-
-          if (
-            latestState.cleanup !== cleanup
-          ) {
-            return;
-          }
-
-          cleanupCurrent(guildId);
-
-          speakNext(guildId);
-        };
-
-        currentState.cleanup = cleanup;
-
-        currentState.player.once(
-          AudioPlayerStatus.Idle,
-          cleanup
+        speakNext(
+          guildId
         );
+      };
 
-        currentState.player.once(
-          "error",
-          (err) => {
-            console.error(
-              "❌ Audio error:",
-              err
-            );
+    state.cleanup =
+      cleanup;
 
-            cleanup();
-          }
-        );
+    state.player.once(
+      AudioPlayerStatus.Idle,
+      cleanup
+    );
 
-      } catch (err) {
+    state.player.once(
+      "error",
+      (error) => {
         console.error(
-          "❌ Playback error:",
-          err
+          "❌ Audio player error:",
+          error
         );
 
-        cleanupCurrent(guildId);
-        speakNext(guildId);
+        cleanup();
       }
-    });
+    );
 
   } catch (error) {
-    console.error("❌ TTS error:", error);
+    console.error(
+      "❌ Playback error:",
+      error
+    );
 
-    cleanupCurrent(guildId);
-    speakNext(guildId);
+    try {
+      if (
+        fs.existsSync(
+          filePath
+        )
+      ) {
+        fs.unlinkSync(
+          filePath
+        );
+      }
+    } catch {}
+
+    cleanupCurrent(
+      guildId
+    );
+
+    speakNext(
+      guildId
+    );
   }
 }
 
@@ -461,7 +654,9 @@ function speakNext(guildId) {
 client.on(
   "messageCreate",
   async (message) => {
-    if (message.author.bot) return;
+    if (message.author.bot) {
+      return;
+    }
 
     const content =
       message.content.trim();
@@ -469,7 +664,9 @@ client.on(
     const guildId =
       message.guild?.id;
 
-    if (!guildId) return;
+    if (!guildId) {
+      return;
+    }
 
     // =========================
     // !command
@@ -488,7 +685,7 @@ client.on(
 
         "🧠 **AI VOICE**\n" +
         "Join a voice channel and talk normally.\n" +
-        "I'll listen and reply with AI.\n\n" +
+        "I'll listen, think, and reply with AI.\n\n" +
 
         "🗣️ **SPEECH**\n" +
         "`!say <message>` — Make me speak\n" +
@@ -520,7 +717,9 @@ client.on(
         );
       }
 
-      if (servers.get(guildId)) {
+      if (
+        servers.get(guildId)
+      ) {
         return message.reply(
           "✅ I'm already in a voice channel."
         );
@@ -574,7 +773,27 @@ client.on(
         } catch {}
       }
 
-      servers.delete(guildId);
+      // Clean queued audio files
+      for (
+        const item of state.queue
+      ) {
+        try {
+          if (
+            item.filePath &&
+            fs.existsSync(
+              item.filePath
+            )
+          ) {
+            fs.unlinkSync(
+              item.filePath
+            );
+          }
+        } catch {}
+      }
+
+      servers.delete(
+        guildId
+      );
 
       return message.reply(
         "👋 Left the voice channel."
@@ -595,13 +814,32 @@ client.on(
         );
       }
 
+      for (
+        const item of state.queue
+      ) {
+        try {
+          if (
+            item.filePath &&
+            fs.existsSync(
+              item.filePath
+            )
+          ) {
+            fs.unlinkSync(
+              item.filePath
+            );
+          }
+        } catch {}
+      }
+
       state.queue = [];
 
       try {
         state.player.stop();
       } catch {}
 
-      cleanupCurrent(guildId);
+      cleanupCurrent(
+        guildId
+      );
 
       return message.reply(
         "🛑 Speech stopped and queue cleared."
@@ -741,13 +979,17 @@ client.on(
           "🔊 **Currently speaking**\n\n";
       }
 
-      if (state.queue.length > 0) {
+      if (
+        state.queue.length > 0
+      ) {
         state.queue.forEach(
           (item, index) => {
             const text =
               item.text.length > 100
-                ? item.text.slice(0, 100) +
-                  "..."
+                ? item.text.slice(
+                    0,
+                    100
+                  ) + "..."
                 : item.text;
 
             response +=
@@ -759,7 +1001,9 @@ client.on(
           "No messages waiting.";
       }
 
-      return message.reply(response);
+      return message.reply(
+        response
+      );
     }
 
     // =========================
@@ -776,7 +1020,9 @@ client.on(
         );
       }
 
-      if (state.queue.length === 0) {
+      if (
+        state.queue.length === 0
+      ) {
         return message.reply(
           "📋 The queue is already empty."
         );
@@ -784,6 +1030,23 @@ client.on(
 
       const amount =
         state.queue.length;
+
+      for (
+        const item of state.queue
+      ) {
+        try {
+          if (
+            item.filePath &&
+            fs.existsSync(
+              item.filePath
+            )
+          ) {
+            fs.unlinkSync(
+              item.filePath
+            );
+          }
+        } catch {}
+      }
 
       state.queue = [];
 
@@ -806,27 +1069,31 @@ client.on(
         );
       }
 
-      let status = "⏹️ Idle";
+      let status =
+        "⏹️ Idle";
 
       if (
         state.player.state.status ===
         AudioPlayerStatus.Playing
       ) {
-        status = "🟢 Playing";
+        status =
+          "🟢 Playing";
       }
 
       if (
         state.player.state.status ===
         AudioPlayerStatus.Paused
       ) {
-        status = "⏸️ Paused";
+        status =
+          "⏸️ Paused";
       }
 
       return message.reply(
-        `🎙️ **TTS Status**\n\n` +
+        `🎙️ **TTS + AI Status**\n\n` +
         `Status: ${status}\n` +
         `Queue: **${state.queue.length}**\n` +
-        `🎤 Voice listener: **ON**`
+        `🎤 Voice listener: **ON**\n` +
+        `🧠 AI: **READY**`
       );
     }
 
@@ -834,7 +1101,9 @@ client.on(
     // !say
     // =========================
 
-    if (content.startsWith("!say ")) {
+    if (
+      content.startsWith("!say ")
+    ) {
       const text =
         content.slice(5).trim();
 
@@ -869,9 +1138,20 @@ client.on(
           );
       }
 
+      const speechFile =
+        await createSpeechFile(
+          text
+        );
+
+      if (!speechFile) {
+        return message.reply(
+          "❌ I couldn't generate the voice."
+        );
+      }
+
       state.queue.push({
+        filePath: speechFile,
         text,
-        language: "en",
       });
 
       const position =
@@ -882,7 +1162,9 @@ client.on(
         `📋 Added to speech queue. Position: **${position}**`
       );
 
-      speakNext(guildId);
+      speakNext(
+        guildId
+      );
     }
   }
 );
