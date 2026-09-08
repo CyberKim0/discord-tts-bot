@@ -110,27 +110,11 @@ async function transcribeAudio(filePath) {
     console.log("🧠 Transcribing with Gemini...");
 
     const response =
-      await gemini.models.generateContent({
-        model: TRANSCRIBE_MODEL,
+  await gemini.models.generateContent({
+    model: TRANSCRIBE_MODEL,
 
-        contents: [
-          {
-            fileData: {
-              fileUri: audioFile.uri,
-              mimeType: audioFile.mimeType || "audio/wav",
-            },
-          },
-        ],
-
-        config: {
-          systemInstruction:
-            "Transcribe the speech accurately. " +
-            "Return only the words that were spoken. " +
-            "Do not explain anything.",
-
-          temperature: 0,
-        },
-      });
+    contents: [audioFile],
+  });
 
     const text =
       response.text?.trim();
