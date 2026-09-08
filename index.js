@@ -13,27 +13,26 @@ const {
 } = require("@discordjs/voice");
 
 const prism = require("prism-media");
-const OpenAI = require("openai");
+const { GoogleGenAI } = require("@google/genai");
 const gTTS = require("gtts");
 
 const fs = require("fs");
 const path = require("path");
 
-// =========================
-// GEMINI AI
-// =========================
+// ==================================================
+// GEMINI
+// ==================================================
 
-const ai = new OpenAI({
+const gemini = new GoogleGenAI({
   apiKey: process.env.GEMINI_API_KEY,
-  baseURL:
-    "https://generativelanguage.googleapis.com/v1beta/openai/",
 });
 
-const AI_MODEL = "gemini-2.5-flash";
+const AI_MODEL = "gemini-3.8-flash";
+const TRANSCRIBE_MODEL = "gemini-3.5-transcribe";
 
-// =========================
+// ==================================================
 // DISCORD CLIENT
-// =========================
+// ==================================================
 
 const client = new Client({
   intents: [
@@ -44,24 +43,20 @@ const client = new Client({
   ],
 });
 
-// =========================
+// ==================================================
 // VOICE SERVERS
-// =========================
+// ==================================================
 
 const servers = new Map();
-
-// Prevent repeated voice requests
-const userCooldowns = new Map();
-const VOICE_COOLDOWN = 3000;
 
 client.once("clientReady", () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
   console.log("🧠 Gemini AI enabled");
 });
 
-// =========================
+// ==================================================
 // WAV HEADER
-// =========================
+// ==================================================
 
 function createWavBuffer(pcmData) {
   const sampleRate = 48000;
@@ -97,60 +92,59 @@ function createWavBuffer(pcmData) {
   return Buffer.concat([header, pcmData]);
 }
 
-// =========================
+// ==================================================
 // GEMINI TRANSCRIPTION
-// =========================
+// ==================================================
 
 async function transcribeAudio(filePath) {
   try {
+    console.log("🧠 Uploading audio to Gemini...");
+
+    const audioFile = await gemini.files.upload({
+      file: filePath,
+      config: {
+        mimeType: "audio/wav",
+      },
+    });
+
     console.log("🧠 Transcribing with Gemini...");
 
-    const audioData = fs.readFileSync(filePath);
-    const base64Audio = audioData.toString("base64");
-
     const response =
-      await ai.chat.completions.create({
-        model: AI_MODEL,
+      await gemini.models.generateContent({
+        model: TRANSCRIBE_MODEL,
 
-        messages: [
+        contents: [
           {
-            role: "system",
-            content:
-              "Transcribe the user's speech accurately. " +
-              "Return only the spoken words. " +
-              "Do not add explanations.",
-          },
-
-          {
-            role: "user",
-            content: [
-              {
-                type: "text",
-                text:
-                  "Transcribe this Discord voice recording.",
-              },
-
-              {
-                type: "input_audio",
-                input_audio: {
-                  data: base64Audio,
-                  format: "wav",
-                },
-              },
-            ],
+            fileData: {
+              fileUri: audioFile.uri,
+              mimeType: audioFile.mimeType || "audio/wav",
+            },
           },
         ],
+
+        config: {
+          systemInstruction:
+            "Transcribe the speech accurately. " +
+            "Return only the words that were spoken. " +
+            "Do not explain anything.",
+
+          temperature: 0,
+        },
       });
 
-    return (
-      response.choices?.[0]?.message?.content?.trim() ||
-      null
-    );
+    const text =
+      response.text?.trim();
+
+    if (!text) {
+      return null;
+    }
+
+    return text;
 
   } catch (error) {
     console.error(
       "❌ Gemini transcription error:",
-      error.status,
+      error.status || "",
       error.message || error
     );
 
@@ -158,61 +152,57 @@ async function transcribeAudio(filePath) {
   }
 }
 
-// =========================
+// ==================================================
 // GEMINI AI RESPONSE
-// =========================
+// ==================================================
 
 async function getAIResponse(text) {
   try {
     console.log("🤖 Asking Gemini...");
 
     const response =
-      await ai.chat.completions.create({
+      await gemini.models.generateContent({
         model: AI_MODEL,
 
-        messages: [
-          {
-            role: "system",
-            content:
-              "You are a fast, friendly Discord voice assistant " +
-              "specialized in cybersecurity, ethical hacking, " +
-              "Linux, networking, programming and CTFs. " +
+        contents: text,
 
-              "Answer normal cybersecurity and ethical-hacking " +
-              "questions directly and clearly. " +
+        config: {
+          systemInstruction:
+            "You are a fast and friendly Discord voice assistant " +
+            "specialized in cybersecurity, ethical hacking, " +
+            "Linux, networking, programming and CTFs. " +
 
-              "For hacking questions, focus on authorized testing, " +
-              "CTFs, labs, defensive security and systems the user " +
-              "owns or has permission to test. " +
+            "Answer normal cybersecurity and ethical-hacking " +
+            "questions directly and clearly. " +
 
-              "Do not unnecessarily refuse harmless educational " +
-              "cybersecurity questions. " +
+            "For hacking questions, focus on authorized testing, " +
+            "CTFs, labs, defensive security and systems the user " +
+            "owns or has permission to test. " +
 
-              "Keep spoken answers short and natural, usually " +
-              "one to four sentences. " +
+            "Do not unnecessarily refuse harmless educational " +
+            "cybersecurity questions. " +
 
-              "Do not use markdown, emojis, bullet points or " +
-              "long explanations.",
-          },
+            "Keep spoken answers short and natural, usually " +
+            "one to four sentences. " +
 
-          {
-            role: "user",
-            content: text,
-          },
-        ],
+            "Do not use markdown, emojis, bullet points, " +
+            "or long explanations.",
 
-        reasoning_effort: "minimal",
+          temperature: 0.3,
+
+          maxOutputTokens: 250,
+        },
       });
 
     return (
-      response.choices?.[0]?.message?.content?.trim() ||
+      response.text?.trim() ||
       "I don't have an answer for that."
     );
 
   } catch (error) {
     console.error(
       "❌ Gemini response error:",
-      error.status,
+      error.status || "",
       error.message || error
     );
 
@@ -224,9 +214,9 @@ async function getAIResponse(text) {
   }
 }
 
-// =========================
+// ==================================================
 // LISTEN TO USER
-// =========================
+// ==================================================
 
 function listenToUser(state, userId) {
   if (
@@ -237,30 +227,17 @@ function listenToUser(state, userId) {
     return;
   }
 
+  const guildId =
+    state.connection.joinConfig.guildId;
+
   const guild =
-    state.connection.joinConfig.guildId
-      ? client.guilds.cache.get(
-          state.connection.joinConfig.guildId
-        )
-      : null;
+    client.guilds.cache.get(guildId);
 
   const member =
     guild?.members.cache.get(userId);
 
   // Ignore bots
   if (member?.user?.bot) {
-    return;
-  }
-
-  // Cooldown
-  const now = Date.now();
-  const lastMessage =
-    userCooldowns.get(userId) || 0;
-
-  if (
-    now - lastMessage <
-    VOICE_COOLDOWN
-  ) {
     return;
   }
 
@@ -280,7 +257,7 @@ function listenToUser(state, userId) {
           end: {
             behavior:
               EndBehaviorType.AfterSilence,
-            duration: 600,
+            duration: 800,
           },
         }
       );
@@ -291,19 +268,9 @@ function listenToUser(state, userId) {
     );
 
     state.listeningUsers.delete(userId);
+
     return;
   }
-
-  // Prevent Discord voice receiver errors
-  audioStream.on("error", (error) => {
-    console.error(
-      "⚠️ Audio stream error:",
-      error.message || error
-    );
-
-    state.listeningUsers.delete(userId);
-    state.processing = false;
-  });
 
   const decoder =
     new prism.opus.Decoder({
@@ -335,19 +302,21 @@ function listenToUser(state, userId) {
       Buffer.concat(pcmChunks);
 
     // Ignore extremely short audio
-    if (pcmData.length < 20000) {
+    if (pcmData.length < 12000) {
+      console.log("⚠️ Audio too short.");
       return;
     }
 
     const wavData =
       createWavBuffer(pcmData);
 
-    const filePath = path.join(
-      __dirname,
-      `voice-${Date.now()}-${Math.random()
-        .toString(36)
-        .slice(2)}.wav`
-    );
+    const filePath =
+      path.join(
+        __dirname,
+        `voice-${Date.now()}-${Math.random()
+          .toString(36)
+          .slice(2)}.wav`
+      );
 
     try {
       fs.writeFileSync(
@@ -357,9 +326,9 @@ function listenToUser(state, userId) {
 
       state.processing = true;
 
-      // =========================
-      // TRANSCRIBE
-      // =========================
+      // ------------------------------------------
+      // TRANSCRIPTION
+      // ------------------------------------------
 
       const text =
         await transcribeAudio(filePath);
@@ -382,16 +351,9 @@ function listenToUser(state, userId) {
         `👤 User said: ${text}`
       );
 
-      // Update cooldown only after
-      // successful transcription
-      userCooldowns.set(
-        userId,
-        Date.now()
-      );
-
-      // =========================
+      // ------------------------------------------
       // AI RESPONSE
-      // =========================
+      // ------------------------------------------
 
       const reply =
         await getAIResponse(text);
@@ -402,21 +364,21 @@ function listenToUser(state, userId) {
 
       state.processing = false;
 
-      // =========================
-      // SPEAK RESPONSE
-      // =========================
+      // ------------------------------------------
+      // SPEECH QUEUE
+      // ------------------------------------------
 
       state.queue.push({
         text: reply,
         language: "en",
       });
 
-      const guildId =
-        state.connection.joinConfig.guildId;
-
       speakNext(guildId);
 
-      // Remove temporary file
+      // ------------------------------------------
+      // DELETE TEMP FILE
+      // ------------------------------------------
+
       if (fs.existsSync(filePath)) {
         fs.unlinkSync(filePath);
       }
@@ -448,9 +410,9 @@ function listenToUser(state, userId) {
   });
 }
 
-// =========================
+// ==================================================
 // CREATE VOICE STATE
-// =========================
+// ==================================================
 
 function createVoiceState(voiceChannel) {
   const guildId =
@@ -460,9 +422,9 @@ function createVoiceState(voiceChannel) {
     joinVoiceChannel({
       channelId: voiceChannel.id,
       guildId,
+
       adapterCreator:
-        voiceChannel.guild
-          .voiceAdapterCreator,
+        voiceChannel.guild.voiceAdapterCreator,
 
       selfDeaf: false,
     });
@@ -508,10 +470,6 @@ function createVoiceState(voiceChannel) {
     state
   );
 
-  // =========================
-  // VOICE LISTENER
-  // =========================
-
   connection.receiver.speaking.on(
     "start",
     (userId) => {
@@ -529,15 +487,17 @@ function createVoiceState(voiceChannel) {
   return state;
 }
 
-// =========================
+// ==================================================
 // CLEANUP AUDIO
-// =========================
+// ==================================================
 
 function cleanupCurrent(guildId) {
   const state =
     servers.get(guildId);
 
-  if (!state) return;
+  if (!state) {
+    return;
+  }
 
   if (state.currentFile) {
     try {
@@ -558,15 +518,17 @@ function cleanupCurrent(guildId) {
   state.cleanup = null;
 }
 
-// =========================
+// ==================================================
 // TTS QUEUE
-// =========================
+// ==================================================
 
 function speakNext(guildId) {
   const state =
     servers.get(guildId);
 
-  if (!state) return;
+  if (!state) {
+    return;
+  }
 
   if (state.speaking) {
     return;
@@ -607,14 +569,8 @@ function speakNext(guildId) {
 
         if (!currentState) {
           try {
-            if (
-              fs.existsSync(
-                filePath
-              )
-            ) {
-              fs.unlinkSync(
-                filePath
-              );
+            if (fs.existsSync(filePath)) {
+              fs.unlinkSync(filePath);
             }
           } catch {}
 
@@ -627,13 +583,8 @@ function speakNext(guildId) {
             error.message || error
           );
 
-          cleanupCurrent(
-            guildId
-          );
-
-          speakNext(
-            guildId
-          );
+          cleanupCurrent(guildId);
+          speakNext(guildId);
 
           return;
         }
@@ -652,44 +603,37 @@ function speakNext(guildId) {
             `🔊 Speaking: ${item.text}`
           );
 
-          const cleanup =
-            () => {
-              const latestState =
-                servers.get(
-                  guildId
-                );
+          const cleanup = () => {
+            const latestState =
+              servers.get(guildId);
 
-              if (!latestState) {
-                try {
-                  if (
-                    fs.existsSync(
-                      filePath
-                    )
-                  ) {
-                    fs.unlinkSync(
-                      filePath
-                    );
-                  }
-                } catch {}
+            if (!latestState) {
+              try {
+                if (
+                  fs.existsSync(
+                    filePath
+                  )
+                ) {
+                  fs.unlinkSync(
+                    filePath
+                  );
+                }
+              } catch {}
 
-                return;
-              }
+              return;
+            }
 
-              if (
-                latestState.cleanup !==
-                cleanup
-              ) {
-                return;
-              }
+            if (
+              latestState.cleanup !==
+              cleanup
+            ) {
+              return;
+            }
 
-              cleanupCurrent(
-                guildId
-              );
+            cleanupCurrent(guildId);
 
-              speakNext(
-                guildId
-              );
-            };
+            speakNext(guildId);
+          };
 
           currentState.cleanup =
             cleanup;
@@ -705,13 +649,8 @@ function speakNext(guildId) {
             error.message || error
           );
 
-          cleanupCurrent(
-            guildId
-          );
-
-          speakNext(
-            guildId
-          );
+          cleanupCurrent(guildId);
+          speakNext(guildId);
         }
       }
     );
@@ -722,19 +661,14 @@ function speakNext(guildId) {
       error.message || error
     );
 
-    cleanupCurrent(
-      guildId
-    );
-
-    speakNext(
-      guildId
-    );
+    cleanupCurrent(guildId);
+    speakNext(guildId);
   }
 }
 
-// =========================
+// ==================================================
 // PREFIX COMMANDS
-// =========================
+// ==================================================
 
 client.on(
   "messageCreate",
@@ -753,9 +687,9 @@ client.on(
       return;
     }
 
-    // =========================
-    // !command
-    // =========================
+    // ==================================================
+    // !COMMAND
+    // ==================================================
 
     if (
       content === "!command" ||
@@ -788,9 +722,9 @@ client.on(
       );
     }
 
-    // =========================
-    // !join
-    // =========================
+    // ==================================================
+    // !JOIN
+    // ==================================================
 
     if (content === "!join") {
       const voiceChannel =
@@ -818,9 +752,9 @@ client.on(
       );
     }
 
-    // =========================
-    // !leave
-    // =========================
+    // ==================================================
+    // !LEAVE
+    // ==================================================
 
     if (content === "!leave") {
       const state =
@@ -858,18 +792,16 @@ client.on(
         } catch {}
       }
 
-      servers.delete(
-        guildId
-      );
+      servers.delete(guildId);
 
       return message.reply(
         "👋 Left the voice channel."
       );
     }
 
-    // =========================
-    // !stop
-    // =========================
+    // ==================================================
+    // !STOP
+    // ==================================================
 
     if (content === "!stop") {
       const state =
@@ -887,18 +819,16 @@ client.on(
         state.player.stop();
       } catch {}
 
-      cleanupCurrent(
-        guildId
-      );
+      cleanupCurrent(guildId);
 
       return message.reply(
         "🛑 Speech stopped and queue cleared."
       );
     }
 
-    // =========================
-    // !pause
-    // =========================
+    // ==================================================
+    // !PAUSE
+    // ==================================================
 
     if (content === "!pause") {
       const state =
@@ -926,9 +856,9 @@ client.on(
       );
     }
 
-    // =========================
-    // !play
-    // =========================
+    // ==================================================
+    // !PLAY
+    // ==================================================
 
     if (content === "!play") {
       const state =
@@ -956,9 +886,9 @@ client.on(
       );
     }
 
-    // =========================
-    // !skip
-    // =========================
+    // ==================================================
+    // !SKIP
+    // ==================================================
 
     if (content === "!skip") {
       const state =
@@ -983,9 +913,9 @@ client.on(
       );
     }
 
-    // =========================
-    // !queue
-    // =========================
+    // ==================================================
+    // !QUEUE
+    // ==================================================
 
     if (content === "!queue") {
       const state =
@@ -1036,9 +966,9 @@ client.on(
       );
     }
 
-    // =========================
-    // !clear
-    // =========================
+    // ==================================================
+    // !CLEAR
+    // ==================================================
 
     if (content === "!clear") {
       const state =
@@ -1066,9 +996,9 @@ client.on(
       );
     }
 
-    // =========================
-    // !status
-    // =========================
+    // ==================================================
+    // !STATUS
+    // ==================================================
 
     if (content === "!status") {
       const state =
@@ -1108,13 +1038,15 @@ client.on(
       );
     }
 
-    // =========================
-    // !say
-    // =========================
+    // ==================================================
+    // !SAY
+    // ==================================================
 
     if (content.startsWith("!say ")) {
       const text =
-        content.slice(5).trim();
+        content
+          .slice(5)
+          .trim();
 
       if (!text) {
         return message.reply(
@@ -1165,9 +1097,9 @@ client.on(
   }
 );
 
-// =========================
+// ==================================================
 // LOGIN
-// =========================
+// ==================================================
 
 client.login(
   process.env.DISCORD_TOKEN
